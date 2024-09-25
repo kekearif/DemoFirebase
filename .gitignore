@@ -1,0 +1,31 @@
+# Tuist
+
+Derived/
+Tuist/.build
+Tuist/.swiftpm
+
+# Project
+
+*.xcodeproj
+*.xcworkspace
+
+# .DS_Store
+
+.DS_Store
+
+# App packaging
+
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# dotenv secret
+
+.env.secret
+
+# fastlane
+
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output

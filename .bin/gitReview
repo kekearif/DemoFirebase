@@ -1,0 +1,284 @@
+#!/usr/bin/env ruby
+
+require 'octokit'
+require 'git'
+require 'logger'
+
+require 'optparse'
+require 'pp'
+require 'json'
+require 'uri'
+require 'highline'
+require 'colorize'
+
+# Before you run the script, Please fetch origin branch.
+
+OPTS = {
+  GITHUB_TOKEN:    ENV['GITHUB_TOKEN'],
+  GITHUB_USER:     ENV['GITHUB_USER'], 
+  GITHUB_PASSWORD: ENV['GITHUB_PASSWORD'],
+  PULL_LABEL:      'release',
+  REMOTE:          'origin'
+}
+
+
+# --------------------------------------------------
+# Command line arguments
+
+OptionParser.new{ |op|
+  op.banner = "Merge pull requests in GitHub with label #{OPTS[:PULL_LABEL]}. Or define your own pull label."
+  op.on('-u', '--user USERNAME',     'GitHub user name')     { |v| OPTS[:GITHUB_USER] = v }
+  op.on('-p', '--password PASSWORD', 'GitHub password')      { |v| OPTS[:GITHUB_PASSWORD] = v }
+  op.on('-t', '--token TOKEN',       'GitHub access token')  { |v| OPTS[:GITHUB_TOKEN] = v }
+  op.on('-l', '--label Pull Label',  'PR Label to pull')     { |v| OPTS[:PULL_LABEL] = v }
+  op.on('-a', '--automerge', 'Auto merge fast-forward PRs')  { |v| OPTS[:AUTO_MERGE] = v }
+
+  # Help
+  op.on_tail("-h", "--help", "Show this message") do
+    puts op
+    exit
+  end
+}.parse!
+
+# --------------------------------------------------
+# Setup Git client
+
+@logger = Logger.new STDOUT
+@g      = Git.open '.', log: nil  # or @logger
+
+# --------------------------------------------------
+# Setup HighLine for prompting questions
+
+@prompt = HighLine.new
+
+# --------------------------------------------------
+# Setup Octokit
+
+def setupOctokit
+  Octokit.configure do |config|
+    if OPTS[:GITHUB_TOKEN] 
+      config.access_token = OPTS[:GITHUB_TOKEN] or raise 'No GitHub access token given'
+    else
+      config.login    = OPTS[:GITHUB_USER]    or raise 'No GitHub login given'
+      config.password = OPTS[:GITHUB_PASSWORD] or raise 'No GitHub password given'
+    end
+  end
+  stack = Faraday::RackBuilder.new do |builder|
+    #builder.response :post
+    builder.use Octokit::Response::RaiseError
+    builder.adapter Faraday.default_adapter
+  end
+  Octokit.middleware = stack
+end
+
+# --------------------------------------------------
+# Functions
+
+def git command, *args
+  @g.lib.send :command, command, args
+end
+
+def fetch_github_pulls repo=calculate_github_repo
+  # Access pull requests
+  @logger.debug "Fetching pull requests from #{repo}"
+  pulls = Octokit.pulls(repo, {:per_page => 100, :state => 'open'})
+end
+
+def fetch_github_default_branch repo=calculate_github_repo
+  # Access default branch`
+  default_branch = Octokit.repository(repo).default_branch
+  @logger.debug "Fetching default branch of #{repo}: #{default_branch}"
+  base = Octokit.branch(repo, default_branch)
+end
+
+def calculate_github_repo
+  # Figure out the repo user/name
+  remote = @g.remote OPTS[:REMOTE]
+  url = remote.url
+  repo_user, repo_name = if url =~/^http/
+                            URI(url).path.split(/[\/\.]/)[1..2]
+                         else
+                            url.split(':')[1].split(/[\/\.]/)
+                         end                         
+  @logger.info "Extracted repo user '#{repo_user}' name '#{repo_name}' from remote '#{OPTS[:REMOTE]}' (#{remote.url})"
+  return "#{repo_user}/#{repo_name}"
+end
+
+def calculate_build_number
+  @g.branches.inject 0 do |build_number, branch|
+    if branch.name.start_with? OPTS[:BUILD_PREFIX]
+      n = branch.name[OPTS[:BUILD_PREFIX].length..-1].to_i
+      if n > build_number
+        build_number = n
+      end
+    end
+    build_number
+  end
+end
+
+def have_conficts_with_branch branch
+  merge_result = `git merge --no-commit --no-ff origin/#{branch} | tail -n 1`
+  conflict = merge_result.include? "Automatic merge failed"
+  abort = `git merge --abort`
+  conflict
+end
+
+def merge_branches branches, allow_conflict=false
+  puts "Merging following branches".colorize(:yellow)
+  puts branches
+
+  merged = []
+  branches.each do |br|
+    if have_conficts_with_branch(br) and !allow_conflict
+      puts "#{br} have conflicts".colorize(:red)
+    else
+      merged << br
+      puts "Merging branch #{br}..."
+      `git merge origin/#{br}`
+    end
+  end
+  return merged
+end
+
+# Determine if a git ref is merged, has conflicts against current branch, or can be merged without conflict
+# Note: merged_refs, refs_to_merge_with_conflicts, and refs_to_merge_without_conflicts are passed by reference
+#       and modified by this function
+#
+# parameters:
+#  - url: url of the ref on GitHub for display
+#  - name: name of the ref
+#  - merged_refs: a list of refs that are already merged
+#  - refs_to_merge_without_conflicts: a list of refs that has no conflicts with the current ref
+#  - refs_to_merge_with_conflicts: a list of refs that has conflicts with the current ref
+#
+# returns: 
+#  - String
+#
+def get_ref_mergability url, name, merged_refs, refs_to_merge_without_conflicts, refs_to_merge_with_conflicts
+  conflict = have_conficts_with_branch(name)
+  merged = `git merge-base HEAD origin/#{name}` == `git show origin/#{name} --format='%H' | head -n1`
+  if merged
+    merged_refs << "#{url} #{name}" 
+  else 
+    if conflict 
+      refs_to_merge_with_conflicts << "#{url} #{name}"
+    else 
+      refs_to_merge_without_conflicts << "#{url} #{name}"
+    end 
+  end
+  
+  "Merged:#{merged} Conflict:#{conflict} #{url} #{name}" 
+end
+
+# Determine if the pull requests are merged, has conflicts against current branch, or can be merged without conflict
+#
+# Returns: Array of string
+#
+# See get_ref_mergability
+#
+def get_pr_mergability pulls, merged_branches, branches_to_merge_without_conflicts, branches_to_merge_with_conflicts
+  pulls.map { |b| 
+    url = b._links.html.href
+    name = b.head.ref
+    
+    get_ref_mergability(url, name, merged_branches, branches_to_merge_without_conflicts, branches_to_merge_with_conflicts)
+  }
+end
+
+# Determine if the base branch is merged, has conflicts against current branch, or can be merged without conflict
+#
+# Returns: String
+#
+# See get_ref_mergability
+#
+def get_base_branch_mergability base, merged_branches, branches_to_merge_without_conflicts, branches_to_merge_with_conflicts
+  url = base._links.html
+  name = base.name
+  get_ref_mergability(url, name, merged_branches, branches_to_merge_without_conflicts, branches_to_merge_with_conflicts)
+end
+
+# --------------------------------------------------
+# MAIN SCRIPT
+
+# Setup Octokit, make sure we have defined
+# 1. an access token
+# 2. both github user name and password
+unless OPTS[:GITHUB_TOKEN] || (OPTS[:GITHUB_USER] && OPTS[:GITHUB_PASSWORD])
+  puts "GITHUB_USER and GITHUB_PASSWORD haven't setup, you can add them in bash profle(.profile, .zshrc...) latter, for example:".colorize(:yellow)
+  puts "export GITHUB_USER=\"Your_github_user_name\""
+  puts "export GITHUB_PASSWORD=\"Your_github_password\""
+  puts ""
+  OPTS[:GITHUB_USER]    = @prompt.ask "Github Username:"
+  OPTS[:GITHUB_PASSWORD] = @prompt.ask("Github Password:") { |q| q.echo = "*" }
+end
+setupOctokit
+
+# Sync origin branches with remote
+`git fetch origin`
+
+pulls = fetch_github_pulls
+default_branch = fetch_github_default_branch
+
+pulls = pulls.select{ |pull| pull.labels.map { |label| label.name }.include? OPTS[:PULL_LABEL] }
+
+puts "---- Use label `#{OPTS[:PULL_LABEL]}` for Finding Pull Requests to Merge ----".colorize(:green)          
+
+if pulls.empty?
+  puts "No Pull Requests to Merge".colorize(:green)
+  exit 0
+end
+
+# For printing branch infos
+merged_branches = []
+branches_to_merge_without_conflicts = []
+branches_to_merge_with_conflicts = []
+brnames = []
+
+default_branch_result = get_base_branch_mergability(default_branch, merged_branches, branches_to_merge_without_conflicts, branches_to_merge_with_conflicts)
+brnames += get_pr_mergability(pulls, merged_branches, branches_to_merge_without_conflicts, branches_to_merge_with_conflicts)
+
+puts
+puts "---- Base Branch to Merge ----".colorize(:green)
+puts "#{default_branch_result}"
+puts
+
+puts "---- Found #{brnames.count} Github Pull Request Branches to Merge ----".colorize(:green)
+puts "#{brnames.join "\n"}"
+puts
+
+puts "---- Already Merged ---- \n#{merged_branches.join("\n")}".colorize(:green) if !merged_branches.empty?
+puts
+
+puts "---- Need to be Merged, without Conflicts ---- \n#{branches_to_merge_without_conflicts.join("\n")}".colorize(:yellow)
+puts
+
+puts "---- Need to be Merged, with Conflicts ---- \n#{branches_to_merge_with_conflicts.join("\n")}".colorize(:red)
+puts
+
+if OPTS[:AUTO_MERGE]
+  puts "Auto merge none conflicts branches".colorize(:green)
+  branches = branches_to_merge_without_conflicts.map {|b| b.split(' ').last }
+  merged_branches = merge_branches(branches)
+  merged_pulls = pulls.select do |pull|
+    merged_branches.include?(pull.head.ref)
+  end
+else
+  @prompt.choose do |menu|
+    menu.prompt = "What actions you would like to perform?".colorize(:yellow)
+
+    menu.choice(:"Select branches to merge") { 
+      branch_name = @prompt.ask "Enter branch names(separated by space), Ex: branch1 branch2 branch3".colorize(:yellow)
+      branches = branch_name.split(' ').map(&:strip)
+      merge_branches(branches, true)
+    }
+
+    menu.choices("Auto merge none conflicts branches") {
+      branches = branches_to_merge_without_conflicts.map {|b| b.split(' ').last }
+      merge_branches(branches)
+    }
+
+    menu.choices(:Cancel)
+
+    menu.default = :Cancel
+  end
+end
